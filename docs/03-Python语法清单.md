@@ -505,25 +505,32 @@ self.model_runner = ModelRunner(config, 0, self.events)    # rank0 在主进程
 
 四件套各自的角色：
 
+```mermaid
+sequenceDiagram
+    participant R0 as rank 0（主进程）
+    participant Ri as rank 1,2,…（子进程）
+    Note over R0: ModelRunner(rank=0)
+    Note over Ri: ModelRunner(rank=i)<br/>循环等 Event
+    R0->>R0: call("run", seqs, prefill)
+    R0->>R0: write_shm：[方法名,参数] pickle 后写进 SharedMemory
+    R0->>Ri: event.set() 唤醒
+    Ri->>Ri: event.wait() 被唤醒，read_shm 读出参数
+    par 各 rank 并行
+        R0->>R0: getattr(self,"run")(...) 本地算
+        Ri->>Ri: getattr 调用同名方法，本地算
+    end
+    Note over R0,Ri: 各卡之间还通过 NCCL (dist) 做 GPU 通信（all_reduce）
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  rank 0 (主进程)                  rank 1,2,... (子进程)      │
-│                                                             │
-│  ModelRunner(rank=0)             ModelRunner(rank=i)         │
-│     │                                │                       │
-│     │ call("run", seqs, prefill)     │ (循环等 Event)         │
-│     │   ├─ write_shm: 把[方法名,参数]│                       │
-│     │   │  pickle 后写进 SharedMemory│                       │
-│     │   └─ event.set() ──────────────┼──▶ event.wait() 唤醒 │
-│     │                                │   read_shm: 读出参数  │
-│     │   getattr(self,"run")(...)     │   getattr 调用同名方法 │
-│     │   本地算                       │   本地算               │
-│     │                                │   (NCCL 同步各卡)     │
-│     │                                │                       │
-│     ▼                                ▼                       │
-└─────────────────────────────────────────────────────────────┘
-              ↕ 之间还通过 NCCL (dist) 做 GPU 通信 (all_reduce)
-```
+
+> 📡 **这张图怎么读**：这是一张**时序图（sequence diagram）**，和前面的流程图不同：两条竖线代表两个参与者（rank0 主进程、rank i 子进程），**从上到下是时间流逝**，横向箭头是"谁通知谁 / 谁干什么"，`par ... end` 框表示"这一段两边在并行"。
+>
+> - **背景**：Tensor Parallelism（张量并行）需要多张 GPU 卡同时算同一个模型的不同部分，每张卡由一个独立进程（rank）管理，rank0 是"主"、其余是"子"。
+> - **主进程发起**：rank0 决定要调什么方法（如 `run`），把"方法名 + 参数"打包（pickle）写进共享内存（SharedMemory），再 `event.set()` 按铃通知。
+> - **子进程响应**：子进程一直在 `event.wait()` 等铃响；一响就读共享内存拿参数，用 `getattr` 调用**同名方法**——也就是说**所有 rank 跑同一段代码，只是各算各的那份数据**。
+> - **并行计算**：`par` 框里两边各自本地算（rank0 算它的份、子进程算它们的份），互不阻塞。
+> - **跨卡同步**：算完后各卡通过 **NCCL** 做 GPU 通信（如 all_reduce 把各卡结果合并）——这就是图底部的横向 Note。
+>
+> 🍳 **类比**：rank0 像班长大喇叭喊"现在做第 3 题，参数是这些（写黑板/共享内存）"，各同学（子进程）听到后**同时**各做各的卷子（本地算），最后把答案对一对合并（NCCL）。
 
 | 组件 | 干什么 |
 |---|---|
